@@ -25,7 +25,7 @@ YEAR_RE = re.compile(r"\((19|20)\d{2}\)\s*$")
 
 # e.g. "Monday 26th January"  (assume current year)
 # e.g. "Tuesday 23rd September 2025"
-# (Optional time isn't shown in your examples, but we allow it if it appears later.)
+# Optional time in parentheses at end is allowed if it ever appears.
 LONG_DATE_RE = re.compile(
     r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+"
     r"(\d{1,2})(st|nd|rd|th)\s+"
@@ -49,6 +49,12 @@ MONTHS = {
     "november": 11,
     "december": 12,
 }
+
+# Matches "(22 entries)" or "(1 entry)" and common typo "(22 entires)"
+ENTRIES_SUFFIX_RE = re.compile(
+    r"\(\s*\d+\s+entr(?:y|ies|ires)\s*\)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -122,9 +128,23 @@ def detect_soft_error(page_text: str) -> bool:
     return any(p.lower() in t for p in SOFT_ERROR_PHRASES)
 
 
+def _strip_entries_suffix(raw: str) -> str:
+    """
+    Fleet Updated cells sometimes contain a second line like "(22 entries)".
+    We ignore that completely and parse only the remaining date/time token(s).
+    """
+    # Normalize whitespace first, then remove any "(xx entries)" chunks
+    s = clean_text(raw)
+    s = ENTRIES_SUFFIX_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def parse_fleet_updated(updated_raw: str, now_london: datetime) -> Optional[datetime]:
     """
     Convert fleet Updated cell text into a tz-aware datetime in Europe/London.
+
+    Also strips any "(xx entries)" suffix that may appear in the Updated cell.
 
     Handles:
       - "09:49" -> today at 09:49
@@ -133,11 +153,11 @@ def parse_fleet_updated(updated_raw: str, now_london: datetime) -> Optional[date
       - "Friday" -> most recent Friday at 00:00
       - "Monday 26th January" -> assume current year, time 00:00
       - "Tuesday 23rd September 2025" -> explicit year, time 00:00
-        (Also supports optional "(HH:MM)" on the end if it ever appears.)
+        (Also supports optional "(HH:MM)" at the end if it ever appears.)
 
     If unparseable, returns None.
     """
-    raw = clean_text(updated_raw)
+    raw = _strip_entries_suffix(updated_raw)
 
     if now_london.tzinfo is None:
         raise RuntimeError("now_london must be tz-aware (Europe/London).")
@@ -160,10 +180,12 @@ def parse_fleet_updated(updated_raw: str, now_london: datetime) -> Optional[date
         mm = int(mm_str) if mm_str is not None else 0
 
         try:
-            dt = now_london.replace(year=year_num, month=month_num, day=day_num, hour=hh, minute=mm, second=0, microsecond=0)
+            dt = now_london.replace(
+                year=year_num, month=month_num, day=day_num,
+                hour=hh, minute=mm, second=0, microsecond=0
+            )
             return dt
         except ValueError:
-            # invalid calendar date
             return None
 
     # 2) Yesterday (HH:MM)
