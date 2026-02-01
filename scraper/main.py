@@ -1,3 +1,5 @@
+# scraper/main.py
+
 from __future__ import annotations
 
 import argparse
@@ -17,13 +19,16 @@ from .pistonheads import (
     make_model_year_fields,
 )
 from .parsing import detect_soft_error
+from .known_makes import FALLBACK_MAKES  # ✅ new: fallback full makes list
 
 STOP_BEFORE_LONDON = pytz.timezone("Europe/London").localize(datetime(2023, 1, 1, 0, 0, 0))
+
 
 def iso(dt) -> Optional[str]:
     if dt is None:
         return None
     return dt.isoformat()
+
 
 def run(mode: str) -> None:
     settings = get_settings()
@@ -45,6 +50,7 @@ def run(mode: str) -> None:
     try:
         p = 1
         first_row_signature_this_run: Optional[str] = None
+        known_makes: Optional[list[str]] = None
 
         while True:
             fleet_url = settings.start_url_template.format(p=p)
@@ -56,12 +62,15 @@ def run(mode: str) -> None:
 
             fleet_html = r.text
 
-            # Build known makes from first fleet page we successfully fetch
+            # Build known makes from first fleet page we successfully fetch.
+            # If extraction fails, fall back to the full list you provided.
             if p == 1:
-                known_makes = extract_known_makes_from_fleet_html(fleet_html)
-                if not known_makes:
-                    # safe fallback; still works, just less make extraction
-                    known_makes = []
+                extracted = extract_known_makes_from_fleet_html(fleet_html)
+                known_makes = extracted if extracted else FALLBACK_MAKES
+                print(f"[fleet] known makes loaded: {len(known_makes)} (extracted={len(extracted)})")
+
+            assert known_makes is not None
+
             # Parse rows
             rows = parse_fleet_page(fleet_html, now_london=now_ldn, known_makes=known_makes)
 
@@ -82,6 +91,7 @@ def run(mode: str) -> None:
                             last_mode=mode,
                             last_completed_page=p,
                         )
+                        print(f"[stop] reached previous signature on page {p}.")
                         return
 
             # process each row sequentially
@@ -94,6 +104,7 @@ def run(mode: str) -> None:
                         last_mode=mode,
                         last_completed_page=p,
                     )
+                    print(f"[stop] reached pre-2023 item on page {p}: {row.updated_at_london.isoformat()}")
                     return
 
                 car_url = settings.car_url_template.format(car_id=row.car_id)
@@ -122,7 +133,7 @@ def run(mode: str) -> None:
 
                 existing = db.get_car(row.car_id)
 
-                # common patch fields
+                # Extract make/model/year from the display string using known_makes
                 make, model_name, model_year = make_model_year_fields(row.display_name, known_makes)
 
                 if ownership == "Previously Owned":
@@ -210,10 +221,12 @@ def run(mode: str) -> None:
                 last_mode=mode,
                 last_completed_page=p,
             )
+            print(f"[page] completed page {p} (rows={len(rows)})")
             p += 1
 
     finally:
         ph.close()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -221,6 +234,6 @@ def main():
     args = parser.parse_args()
     run(args.mode)
 
+
 if __name__ == "__main__":
     main()
-
