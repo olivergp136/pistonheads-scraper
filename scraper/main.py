@@ -19,7 +19,7 @@ from .pistonheads import (
     make_model_year_fields,
 )
 from .parsing import detect_soft_error
-from .known_makes import FALLBACK_MAKES  # ✅ new: fallback full makes list
+from .known_makes import FALLBACK_MAKES  # fallback full makes list
 
 STOP_BEFORE_LONDON = pytz.timezone("Europe/London").localize(datetime(2023, 1, 1, 0, 0, 0))
 
@@ -28,6 +28,25 @@ def iso(dt) -> Optional[str]:
     if dt is None:
         return None
     return dt.isoformat()
+
+
+def _get_initial_resume_page(state: Dict[str, Any]) -> int:
+    """
+    Resume initial scrape from the next page after the last completed page.
+
+    We only resume automatically if the last recorded mode was 'initial'.
+    That prevents a nightly run from overwriting last_completed_page and breaking the resume logic.
+
+    If the last run timed out mid-page, last_completed_page will still refer to the last *finished* page,
+    so restarting will re-run the partially processed page (safe).
+    """
+    last_mode = (state.get("last_mode") or "").strip().lower()
+    last_completed = state.get("last_completed_page")
+
+    if last_mode == "initial" and isinstance(last_completed, int) and last_completed >= 1:
+        return last_completed + 1
+
+    return 1
 
 
 def run(mode: str) -> None:
@@ -48,7 +67,17 @@ def run(mode: str) -> None:
     now_ldn = london_now(settings.timezone)
 
     try:
-        p = 1
+        # ✅ Resume logic for long initial scrapes (Render cron timeouts)
+        if mode == "initial":
+            p = _get_initial_resume_page(state)
+            if p > 1:
+                print(f"[resume] initial scrape resuming from page {p} (last_completed_page={p-1})")
+            else:
+                print("[start] initial scrape starting from page 1")
+        else:
+            p = 1
+            print("[start] nightly scrape starting from page 1")
+
         first_row_signature_this_run: Optional[str] = None
         known_makes: Optional[list[str]] = None
 
@@ -64,18 +93,17 @@ def run(mode: str) -> None:
 
             # Build known makes from first fleet page we successfully fetch.
             # If extraction fails, fall back to the full list you provided.
-            if p == 1:
+            if known_makes is None:
                 extracted = extract_known_makes_from_fleet_html(fleet_html)
                 known_makes = extracted if extracted else FALLBACK_MAKES
                 print(f"[fleet] known makes loaded: {len(known_makes)} (extracted={len(extracted)})")
-
-            assert known_makes is not None
 
             # Parse rows
             rows = parse_fleet_page(fleet_html, now_london=now_ldn, known_makes=known_makes)
 
             if not rows:
                 # no table / no results => end
+                print(f"[end] no rows found on page {p}")
                 break
 
             if first_row_signature_this_run is None:
@@ -212,15 +240,18 @@ def run(mode: str) -> None:
                         patch["notes_current"] = new_notes
                         patch["notes_history"] = history
 
-                    # If nothing changed besides updated timestamps, patch will just update those.
                     db.update_car(row.car_id, patch)
 
-            # finished page
+            # finished page: ✅ persist progress so a timed-out run can resume
             db.update_scrape_state(
                 last_run_at=iso(now_ldn),
                 last_mode=mode,
                 last_completed_page=p,
+                # only set last_fleet_signature on completion/stop for nightly,
+                # but it doesn't hurt to keep the first-row signature up to date
+                last_fleet_signature=first_row_signature_this_run if first_row_signature_this_run else None,
             )
+
             print(f"[page] completed page {p} (rows={len(rows)})")
             p += 1
 
