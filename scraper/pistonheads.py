@@ -1,3 +1,5 @@
+# scraper/pistonheads.py
+
 from __future__ import annotations
 
 import random
@@ -5,7 +7,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple
 
 import httpx
 import pytz
@@ -14,6 +16,7 @@ from bs4 import BeautifulSoup
 from .parsing import (
     FleetRow,
     clean_text,
+    normalize_updated_raw,
     parse_fleet_updated,
     detect_soft_error,
     html_notes_to_text,
@@ -53,17 +56,10 @@ class PistonHeadsClient:
         self.client.close()
 
     def get(self, url: str) -> httpx.Response:
-        """
-        Fetch with:
-        - 6–8s jitter between requests
-        - 30min cooldown on genuine 403 then retry
-        """
         for attempt in range(1, self.max_retries + 1):
             jitter_sleep(self.min_delay, self.max_delay)
             r = self.client.get(url)
-
             if r.status_code == 403:
-                # genuine block: cooldown and retry
                 if attempt < self.max_retries:
                     time.sleep(self.cooldown_seconds)
                     continue
@@ -71,9 +67,6 @@ class PistonHeadsClient:
         return r
 
 def extract_known_makes_from_fleet_html(fleet_html: str) -> List[str]:
-    """
-    Use the <select id="marque"> option list as known makes.
-    """
     soup = BeautifulSoup(fleet_html, "html.parser")
     sel = soup.find("select", {"id": "marque"})
     makes: List[str] = []
@@ -84,7 +77,6 @@ def extract_known_makes_from_fleet_html(fleet_html: str) -> List[str]:
         if not val or val.lower() in ("all marques", "all"):
             continue
         makes.append(val)
-    # de-dupe while preserving order
     seen = set()
     out = []
     for m in makes:
@@ -115,7 +107,6 @@ def parse_fleet_page(
 
         owner = clean_text(tds[0].get_text())
 
-        # Model link is in the 3rd td (index 2)
         model_td = tds[2]
         a = model_td.find("a", href=True)
         if not a:
@@ -130,7 +121,7 @@ def parse_fleet_page(
         car_id = int(m.group(1))
 
         updated_td = tds[4]
-        updated_raw = clean_text(updated_td.get_text())
+        updated_raw = normalize_updated_raw(updated_td.get_text())
 
         updated_at = parse_fleet_updated(updated_raw, now_london)
         signature = f"{car_id}|{owner}|{updated_raw}"
@@ -153,8 +144,6 @@ def parse_car_details_page(car_html: str) -> CarDetails:
     ownership = clean_text(ownership_div.get_text()) if ownership_div else None
 
     notes_div = soup.find("div", {"id": "notes"})
-    notes_html = str(notes_div) if notes_div else ""
-    # If we got the whole div HTML, strip wrapper for better text conversion
     notes_text = ""
     if notes_div:
         notes_text = html_notes_to_text(notes_div.decode_contents())
@@ -162,4 +151,3 @@ def parse_car_details_page(car_html: str) -> CarDetails:
 
 def make_model_year_fields(display_name: str, known_makes: List[str]) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     return parse_make_model_year(display_name, known_makes)
-
