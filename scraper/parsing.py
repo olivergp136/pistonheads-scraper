@@ -11,7 +11,6 @@ from typing import Optional, Tuple, List
 import pytz
 from bs4 import BeautifulSoup
 
-# Soft error phrases (skip immediately, no 403 cooldown)
 SOFT_ERROR_PHRASES = [
     "This user's profile is not available",
     "This member limits who may view their full profile",
@@ -23,9 +22,6 @@ SOFT_ERROR_PHRASES = [
 
 YEAR_RE = re.compile(r"\((19|20)\d{2}\)\s*$")
 
-# e.g. "Monday 26th January"  (assume current year)
-# e.g. "Tuesday 23rd September 2025"
-# Optional time in parentheses at end is allowed if it ever appears.
 LONG_DATE_RE = re.compile(
     r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+"
     r"(\d{1,2})(st|nd|rd|th)\s+"
@@ -36,25 +32,12 @@ LONG_DATE_RE = re.compile(
 )
 
 MONTHS = {
-    "january": 1,
-    "february": 2,
-    "march": 3,
-    "april": 4,
-    "may": 5,
-    "june": 6,
-    "july": 7,
-    "august": 8,
-    "september": 9,
-    "october": 10,
-    "november": 11,
-    "december": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
 }
 
-# Matches "(22 entries)" or "(1 entry)" and common typo "(22 entires)"
-ENTRIES_SUFFIX_RE = re.compile(
-    r"\(\s*\d+\s+entr(?:y|ies|ires)\s*\)",
-    re.IGNORECASE,
-)
+# Matches "(22 entries)" / "(1 entry)" and typo "(22 entires)"
+ENTRIES_SUFFIX_RE = re.compile(r"\(\s*\d+\s+entr(?:y|ies|ires)\s*\)", re.IGNORECASE)
 
 
 @dataclass
@@ -73,6 +56,19 @@ def clean_text(s: str) -> str:
     return s
 
 
+def normalize_updated_raw(updated_raw: str) -> str:
+    """
+    Remove any '(xx entries)' noise and normalise whitespace.
+    Use this for:
+      - storing last_updated_raw
+      - building signatures used to stop nightly runs
+    """
+    s = clean_text(updated_raw)
+    s = ENTRIES_SUFFIX_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def html_notes_to_text(notes_html: str) -> str:
     if not notes_html:
         return ""
@@ -87,11 +83,6 @@ def html_notes_to_text(notes_html: str) -> str:
 
 
 def parse_make_model_year(display_name: str, known_makes: List[str]) -> Tuple[Optional[str], Optional[str], Optional[int]]:
-    """
-    - year: pull (YYYY) at end if present
-    - make: longest prefix match against known_makes
-    - model: remainder (minus make and year), stripped
-    """
     dn = display_name.strip()
 
     year = None
@@ -128,41 +119,12 @@ def detect_soft_error(page_text: str) -> bool:
     return any(p.lower() in t for p in SOFT_ERROR_PHRASES)
 
 
-def _strip_entries_suffix(raw: str) -> str:
-    """
-    Fleet Updated cells sometimes contain a second line like "(22 entries)".
-    We ignore that completely and parse only the remaining date/time token(s).
-    """
-    # Normalize whitespace first, then remove any "(xx entries)" chunks
-    s = clean_text(raw)
-    s = ENTRIES_SUFFIX_RE.sub("", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
 def parse_fleet_updated(updated_raw: str, now_london: datetime) -> Optional[datetime]:
-    """
-    Convert fleet Updated cell text into a tz-aware datetime in Europe/London.
-
-    Also strips any "(xx entries)" suffix that may appear in the Updated cell.
-
-    Handles:
-      - "09:49" -> today at 09:49
-      - "Yesterday (22:19)" -> yesterday at 22:19
-      - "Friday (10:01)" -> most recent Friday at 10:01 (within past 7 days)
-      - "Friday" -> most recent Friday at 00:00
-      - "Monday 26th January" -> assume current year, time 00:00
-      - "Tuesday 23rd September 2025" -> explicit year, time 00:00
-        (Also supports optional "(HH:MM)" at the end if it ever appears.)
-
-    If unparseable, returns None.
-    """
-    raw = _strip_entries_suffix(updated_raw)
+    raw = normalize_updated_raw(updated_raw)
 
     if now_london.tzinfo is None:
         raise RuntimeError("now_london must be tz-aware (Europe/London).")
 
-    # 1) Long-form dates: "Monday 26th January" OR "Tuesday 23rd September 2025"
     m = LONG_DATE_RE.fullmatch(raw)
     if m:
         day_num = int(m.group(2))
@@ -180,22 +142,18 @@ def parse_fleet_updated(updated_raw: str, now_london: datetime) -> Optional[date
         mm = int(mm_str) if mm_str is not None else 0
 
         try:
-            dt = now_london.replace(
+            return now_london.replace(
                 year=year_num, month=month_num, day=day_num,
                 hour=hh, minute=mm, second=0, microsecond=0
             )
-            return dt
         except ValueError:
             return None
 
-    # 2) Yesterday (HH:MM)
     m = re.search(r"Yesterday\s*\((\d{1,2}):(\d{2})\)", raw, re.IGNORECASE)
     if m:
         hh, mm = int(m.group(1)), int(m.group(2))
-        dt = (now_london - timedelta(days=1)).replace(hour=hh, minute=mm, second=0, microsecond=0)
-        return dt
+        return (now_london - timedelta(days=1)).replace(hour=hh, minute=mm, second=0, microsecond=0)
 
-    # 3) Weekday (HH:MM)
     m = re.search(
         r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*\((\d{1,2}):(\d{2})\)",
         raw,
@@ -204,31 +162,29 @@ def parse_fleet_updated(updated_raw: str, now_london: datetime) -> Optional[date
     if m:
         wd_name = m.group(1).lower()
         hh, mm = int(m.group(2)), int(m.group(3))
-        target = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"].index(wd_name)
+        target = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].index(wd_name)
         days_back = (now_london.weekday() - target) % 7
         candidate = (now_london - timedelta(days=days_back)).replace(hour=hh, minute=mm, second=0, microsecond=0)
         if candidate > now_london:
-            candidate = candidate - timedelta(days=7)
+            candidate -= timedelta(days=7)
         return candidate
 
-    # 4) Just time "HH:MM"
     m = re.fullmatch(r"(\d{1,2}):(\d{2})", raw)
     if m:
         hh, mm = int(m.group(1)), int(m.group(2))
         dt = now_london.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if dt > now_london + timedelta(minutes=1):
-            dt = dt - timedelta(days=1)
+            dt -= timedelta(days=1)
         return dt
 
-    # 5) Weekday only
     m = re.fullmatch(r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)", raw, re.IGNORECASE)
     if m:
         wd_name = m.group(1).lower()
-        target = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"].index(wd_name)
+        target = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].index(wd_name)
         days_back = (now_london.weekday() - target) % 7
         candidate = (now_london - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0)
         if candidate > now_london:
-            candidate = candidate - timedelta(days=7)
+            candidate -= timedelta(days=7)
         return candidate
 
     return None
